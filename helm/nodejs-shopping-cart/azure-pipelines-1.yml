@@ -1,0 +1,162 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- group: AzureReposPAT
+
+- name: acrName
+  value: 'myacrrepo309'
+
+- name: acrLoginServer
+  value: 'myacrrepo309.azurecr.io'
+
+- name: imageName
+  value: 'nodejs-shopping-cart'
+
+- name: imageTag
+  value: '$(Build.BuildId)'
+
+- name: workingDirectory
+  value: 'nodejs-shoppingcart-app'
+
+- name: nodeVersion
+  value: '18.x'
+
+
+#Build CI - DevSecOps Stage
+stages:
+- stage: BuildAndScan
+  displayName: 'CI - Build, Test, and Security Scan'
+
+  jobs:
+  - job: Build_Test_Scan
+    displayName: 'Node.js Build, Test, Sonarcloud, Trivy'
+    pool:
+      vmImage: 'ubuntu-latest'
+   
+    steps:
+    - checkout: self
+      clean: true
+  
+    - task: NodeTool@0
+      displayName: 'Use Node.js $(nodeVersion)'
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    # Install Dependencies
+    - task: Bash@3
+      displayName: 'Install Dependencies'
+      inputs:
+        targetType: inline
+        workingDirectory: '$(System.DefaultWorkingDirectory)/$(workingDirectory)'
+        script: |
+          npm install
+
+    # SonarCloud: prepare analysis (pointing to the project folder)
+    - task: SonarCloudPrepare@3
+      displayName: 'Prepare Sonarcloud Analysis'
+      inputs:
+        sonarCloud: 'Sonarcloud-service-connection'
+        organization: 'prasu2203'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'Prasu2203_Project5'
+        cliProjectName: 'Project5'
+        # Point to the actual project sources
+        cliSources: '$(System.DefaultWorkingDirectory)/$(workingDirectory)'
+
+    
+    - task: Bash@3
+      displayName: 'Build'
+      inputs:
+        targetType: inline
+        workingDirectory: '$(System.DefaultWorkingDirectory)/$(workingDirectory)'
+        script: |
+          npm run build || echo "No build step defined"
+
+    # SonarCloud: Analyze & Publish
+    - task: SonarCloudAnalyze@3
+      displayName: 'Run SonarCloud Analysis'
+
+    - task: SonarCloudPublish@3
+      displayName: 'Publish SonarCloud Results'
+      inputs: 
+        pollingTimeoutSec: '300'
+
+    #Trivy FS Scan using official task
+    - task: trivy@1
+      displayName: 'Trivy FS Scan'
+      inputs:
+        command: 'fs'
+        path: '$(System.DefaultWorkingDirectory)/$(workingDirectory)'
+        severity: 'HIGH,CRITICAL'
+        exitCode: '0'
+
+# Docker Build + Push (to ACR)
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: build
+        repository: '$(imageName)'
+        dockerfile: '$(System.DefaultWorkingDirectory)/$(workingDirectory)/Dockerfile'
+        tags: |
+          $(imageTag)
+        containerRegistry: 'ACR-service-connection'
+
+      
+    - task: trivy@1
+      displayName: 'Trivy Image Scan'
+      inputs:
+        command: 'image'
+        image: '$(acrLoginServer)/$(imageName):$(imageTag)'
+        severity: 'HIGH,CRITICAL'
+        exitCode: '0'
+
+    - task: Docker@2
+      displayName: 'Push Docker Image to ACR'
+      inputs: 
+        command: push
+        repository: '$(imageName)'
+        tags: |
+          $(imageTag)
+        containerRegistry: 'ACR-service-connection'
+
+# Update Argo CD Manifests repo(GitOps)
+# Clone manifests repo
+    - script: |
+        echo "Cloning manifests repo..."
+        git clone https://$AZURE_REPOS_PAT@dev.azure.com/Prasu2203/Project5/_git/Project5-Manifests-repo manifests
+      displayName: "Clone manifests repo"
+      env:
+        AZURE_REPOS_PAT: $(azure_repos_pat)
+
+
+      
+# Update Helm values (update Image Tag in Deployment yaml file)
+    - script: |
+
+        cd manifests
+
+        sed -i "s|tag:.*|tag: \"$(Build.BuildId)\"|g" helm/nodejs-shopping-cart/values-dev.yaml
+
+        git config user.email "gitops-bot@project5.local"
+        git config user.name "Project5 GitOps Pipeline"
+
+        git add helm/nodejs-shopping-cart/values-dev.yaml
+
+        git commit -m "Update image tag to $(Build.BuildId)" || echo "No changes to commit"
+
+        git push
+
+      displayName: 'Update Helm Values & Push to GitOps Repo'
+
+      env:
+        AZURE_REPOS_PAT: $(azure_repos_pat)
